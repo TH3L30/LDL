@@ -54,6 +54,19 @@ Controls while downloading (when stdin is a TTY):
   or when `aria2c` is missing.
 - **yt-dlp**: for video / site URLs (`--yt-dlp` or auto-detected video pages).
 
+## Re-runs / existing files (aria2 engine)
+
+Re-running the same URLs never shows a bogus `0 B DONE`:
+
+- File already complete on disk → `DONE` with the real size, detail `already complete`.
+- File exists but aria2 can't verify it (e.g. unknown remote size) → `DONE`
+  with the real size, detail `exists (unverified)`.
+- aria2 exits 0 but produced no file, or the file is empty → `FAILED`
+  (`aria2 exit 0 but no file produced` / `empty file (check URL/token)`).
+- Real errors (e.g. HTTP 404) → `FAILED` with the failing URI in Detail.
+
+Partial files resume automatically via aria2 `-c` (recommended default).
+
 ## Features
 
 - Multi-connection segmented downloads (aria2 engine + native fallback)

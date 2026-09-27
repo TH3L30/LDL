@@ -27,6 +27,7 @@ import threading
 import time
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import unquote, urlparse
 
 ARIA2C_BIN = shutil.which("aria2c")
 
@@ -46,6 +47,35 @@ _PROGRESS_RE = re.compile(
     re.I,
 )
 _COMPLETE_RE = re.compile(r"Download complete:\s*(.+?)\s*$", re.I)
+# Trailing summary table, always printed on exit, e.g.:
+#   087c9b|OK  |     392B/s|/tmp/ldl-test/index.html
+#   613161|ERR |       0B/s|https://host/file.iso
+_RESULTS_RE = re.compile(r"^\s*([0-9a-f]+)\|\s*(OK|ERR|INPR)\s*\|[^|]*\|\s*(.+?)\s*$", re.I)
+
+
+def expected_filename(url: str) -> str:
+    """Best-guess on-disk basename aria2 will use: path basename, query stripped.
+
+    Handles signed URLs like .../S01E01.720p.mkv?md5=...&expires=... where the
+    query string must NOT become part of the filename. Returns "" when no
+    meaningful guess exists (magnet links resolve to torrent content names
+    only discoverable via the results table / dir scan) so we never adopt a
+    stray file.
+    """
+    u = url.strip()
+    if u.lower().startswith("magnet:"):
+        return ""
+    try:
+        raw_path = urlparse(u).path
+        if not raw_path or raw_path.endswith("/"):
+            # aria2 saves directory URLs as index.html
+            return "index.html"
+        name = os.path.basename(raw_path.rstrip("/")) or "download.bin"
+        name = unquote(name).split("?")[0].split("#")[0]
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+        return name[:200] or "download.bin"
+    except Exception:
+        return "download.bin"
 
 
 def parse_aria2_size(s: str) -> int:
@@ -114,7 +144,7 @@ def build_cmd(url: str, out_dir: Path, connections: int = 8,
         "--check-certificate=true",
         "--remote-time=true",
         "--summary-interval=1",
-        "--console-log-level=warn",
+        "--console-log-level=notice",  # notice: keeps "Download complete:" + results table visible for parsing
         "--human-readable=true",
         "--show-console-readout=true",
         "--follow-torrent=true",
@@ -140,6 +170,7 @@ def download_with_aria2(url: str, out_dir: Path, limiter, paused: threading.Even
                         extra_args: Optional[List[str]] = None) -> bool:
     """Run one URL through aria2c, feeding progress into LDL's FileJob."""
     job.start_time = time.monotonic()
+    wall_start = time.time()
     job.status = "downloading"
     job.detail = "aria2 engine"
     job.connections_used = connections
@@ -176,21 +207,42 @@ def download_with_aria2(url: str, out_dir: Path, limiter, paused: threading.Even
         return False
 
     completed_path: Optional[str] = None
+    results_error: Optional[str] = None
+    file_exists_hint = False
     last_downloaded = 0
 
     def feed_line(line: str) -> None:
-        nonlocal last_downloaded, completed_path
+        nonlocal last_downloaded, completed_path, results_error, file_exists_hint
         # aria2 redraws progress with '\r' on one console line, so a single
         # read chunk may contain several updates; process ALL matches and
         # keep the last one as current state (absolute bytes -> delta stays
         # correct even when intermediate updates coalesce).
         if not line:
             return
+        if re.search(r"already exists|file exists", line, re.I):
+            file_exists_hint = True
         mc = _COMPLETE_RE.search(line)
         if mc:
             completed_path = mc.group(1).strip()
             job.detail = f"done: {Path(completed_path).name}"[:90]
             return
+        # Download Results table row: authoritative per-file outcome + path.
+        # Checked before the generic keyword filter so OK paths are adopted
+        # and ERR rows are surfaced even for instant (sub-tick) downloads.
+        for chunk in line.replace("\r", "\n").split("\n"):
+            chunk = chunk.strip()
+            if not chunk or "|" not in chunk:
+                continue
+            mr = _RESULTS_RE.match(chunk)
+            if mr and mr.group(1).lower() != "gid":
+                _gid, _stat, _path = mr.group(1), mr.group(2).upper(), mr.group(3).strip()
+                if _stat == "OK" and not _path.lower().startswith("http"):
+                    completed_path = _path
+                    job.detail = f"done: {Path(_path).name}"[:90]
+                elif _stat == "ERR":
+                    results_error = f"aria2: {_path}"[:90]
+                    job.detail = results_error
+                return
         matches = _PROGRESS_RE.findall(line)
         if matches:
             try:
@@ -226,7 +278,9 @@ def download_with_aria2(url: str, out_dir: Path, limiter, paused: threading.Even
             if not chunk:
                 continue
             low = chunk.lower()
-            if any(k in low for k in ("error", "failed", "exception", "retry", "download results", "status", "gid")):
+            if low.startswith("status legend") or low.startswith("gid ") or set(chunk) <= set("= "):
+                continue
+            if any(k in low for k in ("error", "failed", "exception", "retry", "download results", "gid")):
                 job.detail = chunk[-90:]
 
     def pump():
@@ -271,14 +325,26 @@ def download_with_aria2(url: str, out_dir: Path, limiter, paused: threading.Even
         except Exception:
             pass
     rc = proc.wait()
+    # drain remaining stdout (trailing progress / results table) before finalizing
+    try:
+        t.join(timeout=5)
+    except Exception:
+        pass
     job.end_time = time.monotonic()
 
-    # resolve final filename -> point job at the real file for the summary table
+    # resolve final filename -> point job at the real file for the summary table.
+    # Order: explicit "Download complete:" path, results-table OK path, newly
+    # appeared file, then the expected basename (covers re-runs where aria2
+    # verifies an already-complete file and transfers 0 bytes with exit 0).
     final: Optional[Path] = None
     if completed_path:
         p = Path(completed_path)
         if p.exists():
             final = p
+        elif not p.is_absolute():
+            q = out_dir / p.name
+            if q.exists():
+                final = q
     if final is None:
         try:
             after = set(out_dir.iterdir())
@@ -289,15 +355,25 @@ def download_with_aria2(url: str, out_dir: Path, limiter, paused: threading.Even
                 final = new_files[0]
         except Exception:
             pass
+    if final is None:
+        try:
+            guess = expected_filename(url)
+            if guess:
+                cand = out_dir / guess
+                if cand.is_file() and not cand.name.endswith((".aria2", ".torrent")):
+                    final = cand
+        except Exception:
+            pass
+    transferred = last_downloaded  # actual bytes over the wire this session
     if final is not None:
         try:
             job.dest = final
+            real_size = final.stat().st_size
             if not job.total:
-                job.total = final.stat().st_size
+                job.total = real_size
             # ensure downloaded reflects reality at completion; reconcile
             # session throughput for coalesced \r updates missed mid-run
             if rc == 0:
-                real_size = final.stat().st_size
                 if real_size > last_downloaded:
                     missing = real_size - last_downloaded
                     throughput.add(missing)
@@ -311,8 +387,28 @@ def download_with_aria2(url: str, out_dir: Path, limiter, paused: threading.Even
             pass
 
     if rc == 0 and not stop_event.is_set():
+        if final is None:
+            # aria2 exited 0 but produced nothing we can find: never report a
+            # silent 0-byte DONE (was the reported bug).
+            job.status = "failed"
+            job.detail = results_error or "aria2 exit 0 but no file produced"
+            return False
+        if final.stat().st_size == 0 and transferred == 0:
+            job.status = "failed"
+            job.detail = results_error or "empty file (check URL/token)"
+            return False
         job.status = "done"
-        job.detail = ""
+        # re-run over an already-complete file: say so instead of implying a
+        # fresh download. ctime tells whether aria2 wrote the file this
+        # session (m/birthtime are unreliable: --remote-time backdates them
+        # to the server's Last-Modified on this platform). A resumed partial
+        # also counts as fresh.
+        try:
+            st = final.stat()
+            fresh = st.st_ctime >= wall_start - 2
+        except Exception:
+            fresh = transferred > 0
+        job.detail = "" if (transferred > 0 or fresh) else "already complete"
         try:
             elapsed = max(0.001, job.end_time - job.start_time) if job.start_time else 0.001
             job.avg_speed = job.downloaded / elapsed
@@ -322,7 +418,37 @@ def download_with_aria2(url: str, out_dir: Path, limiter, paused: threading.Even
     if stop_event.is_set():
         job.status = "stopped"
     else:
+        # aria2 refuses (ERR + local path, "already exists") when it cannot
+        # verify/resume an existing file, e.g. unknown remote size with
+        # --allow-overwrite=false. The bytes are already on disk: count it as
+        # done but flag it unverified instead of a confusing FAILED.
+        try:
+            exists_size = final.stat().st_size if final is not None else 0
+        except Exception:
+            exists_size = 0
+        err_path = (results_error or "").split("aria2:")[-1].strip()
+        err_is_local = bool(err_path) and not re.match(r"^(https?|ftps?|sftp:|magnet:)", err_path, re.I)
+        if (transferred == 0 and exists_size > 0
+                and (file_exists_hint or err_is_local)):
+            job.status = "done"
+            if not job.total:
+                job.total = exists_size
+            job.downloaded = max(job.downloaded, exists_size)
+            throughput.add(exists_size)
+            try:
+                job.tracker.add(exists_size)
+            except Exception:
+                pass
+            try:
+                elapsed = max(0.001, job.end_time - job.start_time) if job.start_time else 0.001
+                job.avg_speed = job.downloaded / elapsed
+            except Exception:
+                pass
+            job.detail = "exists (unverified)"
+            return True
         job.status = "failed"
-        if not job.detail or job.detail == "aria2 engine":
+        if results_error:
+            job.detail = results_error
+        elif not job.detail or job.detail == "aria2 engine":
             job.detail = f"aria2 exit {rc}"
     return False
