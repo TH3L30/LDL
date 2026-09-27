@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.part
+*.lpart
+*.state
+*.json.state
+.DS_Store
+.venv/
+venv/
+*.log
+Downloads/
