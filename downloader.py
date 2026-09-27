@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-High-performance segmented file downloader.
+High-performance segmented file downloader (aria2 engine + native fallback).
+
+Engines:
+  - aria2 (default when `aria2c` is installed): HTTP(S)/FTP/SFTP segmented
+    downloads, BitTorrent/magnet, Metalink via the aria2c binary
+    (https://aria2.github.io/). LDL acts as a wrapper with its Rich UI.
+  - native: built-in httpx segmented engine (no external binary needed).
+  - yt-dlp backend (optional) for video / site URLs.
 
 Features:
   - Multi-connection segmented HTTP downloads (Range requests) for maximum speed
@@ -16,6 +23,8 @@ Usage:
   python downloader.py <url> [url ...] -o ~/Downloads
   python downloader.py -f urls.txt -o ~/Downloads --connections 16 --speed-limit 5M
   python downloader.py "https://youtube.com/watch?v=..." --yt-dlp
+  python downloader.py <url> --engine aria2 --connections 16
+  python downloader.py <url> --engine native   # force built-in httpx engine
 
 Controls while downloading (when stdin is a TTY):
   P or Space : pause / resume toggle
@@ -35,6 +44,7 @@ import os
 import random
 import re
 import select
+import shlex
 import signal
 import subprocess
 import sys
@@ -1428,8 +1438,12 @@ def parse_args(argv=None):
     ap.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Retries per segment (default 5)")
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="HTTP timeout seconds (default 30)")
     ap.add_argument("--yt-dlp", action="store_true", help="Force yt-dlp backend for all URLs")
-    ap.add_argument("--no-segmented", action="store_true", help="Disable segmented downloads")
+    ap.add_argument("--no-segmented", action="store_true", help="Disable segmented downloads (native engine only)")
     ap.add_argument("--yt-dlp-args", default="", help="Extra args forwarded to yt-dlp (quoted string)")
+    ap.add_argument("--engine", choices=["auto", "aria2", "native"], default="auto",
+                    help="Download engine: auto (aria2 if installed, else native), aria2, native (default: auto)")
+    ap.add_argument("--aria2-args", default="",
+                    help="Extra args forwarded to aria2c (quoted string, e.g. --aria2-args \"--seed-ratio 1.0 --check-integrity=true\")")
     ap.add_argument("--banner", type=int, default=None,
                     choices=range(1, len(_BANNERS) + 1) if _BANNERS else None,
                     metavar="1-%d" % len(_BANNERS) if _BANNERS else "N",
@@ -1536,8 +1550,21 @@ def main(argv=None) -> int:
     show_splash(console, splash_art)
     console.print(Text(LOGO, style="bold cyan", no_wrap=True))
     console.print(f"[bold blue]{APP_NAME} v{APP_VERSION}[/bold blue] - {len(urls)} URL(s) -> {out_dir}")
+    # engine selection: aria2 wrapper is default when aria2c exists
+    try:
+        from aria2_backend import is_available as _aria2_ok, is_torrent_like as _is_torrent_like
+        _aria2_available = _aria2_ok()
+    except Exception:
+        _aria2_available = False
+        def _is_torrent_like(u: str) -> bool:
+            ul = u.strip().lower()
+            return ul.startswith("magnet:") or ul.endswith((".torrent", ".meta4", ".metalink"))
+    if args.engine == "aria2" and not _aria2_available:
+        console.print("[red]Engine 'aria2' requested but aria2c not found. Install: brew install aria2[/red]")
+        return 2
+    _engine_label = "aria2" if (args.engine == "aria2" or (args.engine == "auto" and _aria2_available)) else "native"
     console.print(f"Connections: {args.connections}  Limit: {format_rate_setting(limiter.rate)}  "
-                  f"Retries: {args.retries}  Resume: enabled (.part + .part.json)")
+                  f"Retries: {args.retries}  Engine: {_engine_label}  Resume: enabled")
 
     overall_ok = True
 
@@ -1573,7 +1600,52 @@ def main(argv=None) -> int:
                     overall_ok = False
                 continue
 
-            # probe
+            # aria2 engine (wrapper around aria2c): handles HTTP(S)/FTP/SFTP +
+            # BitTorrent/magnet/Metalink natively. Preferred in auto mode.
+            use_aria2 = (args.engine in ("auto", "aria2")) and _aria2_available
+            if use_aria2:
+                from aria2_backend import download_with_aria2 as _dl_aria2
+                try:
+                    aria2_extra = shlex.split(args.aria2_args) if args.aria2_args else None
+                except Exception:
+                    aria2_extra = args.aria2_args.split() if args.aria2_args else None
+                job = FileJob(url=url, dest=Path(f"aria2 [{idx + 1}] {sanitize_filename(url[:40])}"))
+                jobs.append(job)
+                refresh(idx)
+                done_evt_a = threading.Event()
+                result_a = {"ok": False}
+
+                def run_a():
+                    try:
+                        result_a["ok"] = _dl_aria2(
+                            url, out_dir, limiter, paused, stop_event, job,
+                            throughput, connections=args.connections,
+                            timeout=args.timeout, retries=args.retries,
+                            extra_args=aria2_extra)
+                    except Exception as exc:
+                        job.status = "failed"
+                        job.detail = str(exc)[:120]
+                        result_a["ok"] = False
+                    finally:
+                        done_evt_a.set()
+
+                ta = threading.Thread(target=run_a, daemon=True)
+                ta.start()
+                while not done_evt_a.is_set():
+                    if paused.is_set() and job.status == "downloading":
+                        job.status = "paused"
+                    elif not paused.is_set() and job.status == "paused":
+                        job.status = "downloading"
+                    refresh(idx)
+                    time.sleep(0.25)
+                refresh(idx)
+                if not result_a["ok"] and not stop_event.is_set():
+                    overall_ok = False
+                if stop_event.is_set():
+                    break
+                continue
+
+            # native probe (only reached with --engine native or no aria2c)
             tmp_job = FileJob(url=url, dest=Path("probing..."))
             tmp_job.status = "queued"
             # show placeholder while probing
