@@ -129,6 +129,11 @@ def build_cmd(url: str, out_dir: Path, connections: int = 8,
     connections = max(1, min(32, connections))
     cmd = [
         ARIA2C_BIN,
+        # aria2's built-in async resolver fails against some routers/ISPs
+        # ("Name resolution for host failed: DNS server returned answer with
+        # no data", errorCode=19) which kills every job at 0 B. Delegating to
+        # getaddrinfo (same path curl uses) works.
+        "--async-dns=false",
         "--continue=true",
         "--allow-overwrite=false",
         "--auto-file-renaming=false",
